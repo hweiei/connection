@@ -1,19 +1,12 @@
-/**
- * Tunnel MCP 控制台 & 自动 OAuth 网关 — Cloudflare Worker (v1.5)
- *
- * 职责:
- * 1. 托管前端静态页面 (dist/)
- * 2. /__proxy —— 透明中继 (前端控制台用,浏览器→Worker→隧道,绕开 CORS)
- * 3. /gateway (别名 /__mcp) —— ⭐ 自动 OAuth 网关 + AI GET→POST 桥接:
- *    - 对 POST 请求: 当成免认证的 MCP 端点,Worker 自动用内置 password 登录并注入 Bearer token
- *    - 对 GET  请求: 自动在 Worker 内部完成 MCP initialize 握手(维护 Mcp-Session-Id),并支持:
- *        • GET /gateway                                → 自动握手 + 返回 serverInfo + tools/list 全部工具
- *        • GET /gateway?op=connect                     → 同上,返回完整 serverInfo + tools
- *        • GET /gateway?tool=<工具名>&args=<JSON字符串> → 自动握手 + 调用 tools/call 读本机文件/执行命令
- *        • GET /gateway?method=<JSON-RPC方法>&params=<JSON> → 调用任意 MCP 方法
- *        • GET /gateway/health                         → 查看网关与 token 缓存状态
- *        • GET /gateway/login                          → 强制刷新 OAuth token
+﻿/**
+ * Tunnel MCP 控制台 & 自动 OAuth 网关 — Cloudflare Worker (v1.6.0)
  */
+
+let dynamicConfig = {
+  mcpUrl: "https://affiliates-geek-roger-rides.trycloudflare.com/mcp",
+  password: "hQ3mUUJtRsDG8UCC_knqkBIM2rGby1BFhOJm8bOJSdA",
+  updatedAt: Date.now(),
+};
 
 const DEFAULT_MCP = "https://affiliates-geek-roger-rides.trycloudflare.com/mcp";
 const DEFAULT_PASSWORD = "hQ3mUUJtRsDG8UCC_knqkBIM2rGby1BFhOJm8bOJSdA";
@@ -43,7 +36,6 @@ function originOf(u) {
   return `${x.protocol}//${x.host}`;
 }
 
-/* ============ PKCE 工具 ============ */
 function b64url(buf) {
   const bytes = new Uint8Array(buf);
   let s = "";
@@ -81,11 +73,9 @@ function parseSSE(text) {
   return msgs;
 }
 
-/* ============ 全局(实例级)token 与 session 缓存 ============ */
-const tokenCache = new Map();   // key: mcpUrl → { token, exp, obtainedAt }
-const sessionCache = new Map(); // key: mcpUrl → { sessionId, serverInfo, ts }
+const tokenCache = new Map();
+const sessionCache = new Map();
 
-/* ============ 自动 OAuth 登录 ============ */
 async function autoLogin(mcpUrl, password, log) {
   const origin = originOf(mcpUrl);
   const L = (m, d) => log && log(m, d);
@@ -97,10 +87,22 @@ async function autoLogin(mcpUrl, password, log) {
       if (r.ok) { asm = await r.json(); break; }
     } catch {}
   }
-  const authorizeUrl = asm?.authorization_endpoint || `${origin}/oauth/authorize`;
-  const tokenUrl = asm?.token_endpoint || `${origin}/oauth/token`;
-  const registerUrl = asm?.registration_endpoint || `${origin}/oauth/register`;
-  L("OAuth 端点", JSON.stringify({ authorizeUrl, tokenUrl, registerUrl }));
+
+  // ⭐ fixUrl: 强制把端点锚定在当前存活的新域名上，彻底解决 530
+  const fixUrl = (u, defPath) => {
+    if (!u) return `${origin}${defPath}`;
+    try {
+      const parsed = new URL(u);
+      return `${origin}${parsed.pathname}${parsed.search}`;
+    } catch {
+      return `${origin}${defPath}`;
+    }
+  };
+
+  const authorizeUrl = fixUrl(asm?.authorization_endpoint, "/oauth/authorize");
+  const tokenUrl = fixUrl(asm?.token_endpoint, "/oauth/token");
+  const registerUrl = fixUrl(asm?.registration_endpoint, "/oauth/register");
+  L("OAuth 端点(已修正)", JSON.stringify({ authorizeUrl, tokenUrl, registerUrl }));
 
   const redirectUri = `${origin}/__gw_cb`;
   let clientId = "tunnel-mcp-gateway";
@@ -122,8 +124,6 @@ async function autoLogin(mcpUrl, password, log) {
       clientId = j.client_id || clientId;
       clientSecret = j.client_secret;
       L("客户端注册成功", clientId);
-    } else {
-      L("客户端注册失败,使用默认 clientId", `HTTP ${rr.status}`);
     }
   } catch (e) {
     L("客户端注册异常", String(e));
@@ -145,9 +145,7 @@ async function autoLogin(mcpUrl, password, log) {
   if (asm?.scopes_supported) authUrl.searchParams.set("scope", asm.scopes_supported.join(" "));
 
   const code = await obtainAuthCode(authUrl.toString(), password, redirectUri, L);
-  if (!code) {
-    throw new Error("无法从授权页获取授权码 —— 请检查 password 是否正确");
-  }
+  if (!code) throw new Error("无法从授权页获取授权码 —— 请检查 password 是否正确");
 
   const body = new URLSearchParams();
   body.set("grant_type", "authorization_code");
@@ -229,7 +227,6 @@ async function obtainAuthCode(authUrl, password, redirectUri, L) {
       const m = t.match(/[?&]code=([A-Za-z0-9\-._~]+)/) || t.match(/"code"\s*:\s*"([^"]+)"/);
       if (m) { L("方式B: POST 响应体命中"); return m[1]; }
     }
-    L("方式B未命中", `POST ${postUrl} → HTTP ${pr.status}`);
   } catch (e) {
     L("方式B异常", String(e));
   }
@@ -248,11 +245,11 @@ async function obtainAuthCode(authUrl, password, redirectUri, L) {
     if (c) { L("方式C命中"); return c; }
     if (jr.ok) {
       const j = await jr.json().catch(() => ({}));
-      if (j.code) { L("方式C: JSON code"); return j.code; }
+      if (j.code) return j.code;
       if (j.redirect || j.location) {
         const u = new URL(j.redirect || j.location, redirectUri);
         const cc = u.searchParams.get("code");
-        if (cc) { L("方式C: JSON redirect code"); return cc; }
+        if (cc) return cc;
       }
     }
   } catch (e) {
@@ -264,10 +261,7 @@ async function obtainAuthCode(authUrl, password, redirectUri, L) {
 
 async function getToken(mcpUrl, password, forceNew, log, env) {
   const injected = env && env.MCP_TOKEN;
-  if (injected && !forceNew) {
-    log && log("使用手动注入的 MCP_TOKEN(跳过自动登录)");
-    return injected;
-  }
+  if (injected && !forceNew) return injected;
   if (!forceNew) {
     const cached = tokenCache.get(mcpUrl);
     if (cached && cached.exp > Date.now()) return cached.token;
@@ -277,7 +271,6 @@ async function getToken(mcpUrl, password, forceNew, log, env) {
   return t.token;
 }
 
-/** 发送单次 JSON-RPC 到上游 MCP 并解析 JSON / SSE */
 async function rpcCall(mcpUrl, token, sessionId, method, params, id = 1) {
   const headers = {
     "Content-Type": "application/json",
@@ -313,18 +306,15 @@ async function rpcCall(mcpUrl, token, sessionId, method, params, id = 1) {
   return { status: res.status, sessionId: newSid, result: j.result ?? j };
 }
 
-/** 确保拿到有效 MCP session (initialize + notifications/initialized) */
 async function ensureMcpSession(mcpUrl, token, forceNew = false) {
   if (!forceNew) {
     const cached = sessionCache.get(mcpUrl);
-    if (cached && Date.now() - cached.ts < 10 * 60 * 1000) {
-      return cached;
-    }
+    if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached;
   }
   const init = await rpcCall(mcpUrl, token, null, "initialize", {
     protocolVersion: "2025-06-18",
     capabilities: { roots: { listChanged: true }, sampling: {} },
-    clientInfo: { name: "tunnel-mcp-gateway", version: "1.5.0" },
+    clientInfo: { name: "tunnel-mcp-gateway", version: "1.6.0" },
   }, 1);
   const sid = init.sessionId;
   await rpcCall(mcpUrl, token, sid, "notifications/initialized", {}, null);
@@ -344,46 +334,90 @@ async function ensureMcpSession(mcpUrl, token, forceNew = false) {
   return entry;
 }
 
-/* ============ /gateway 与 /__mcp 处理 ============ */
 async function handleGateway(request, url, env) {
-  const mcpUrl = (url.searchParams.get("tunnel") || url.searchParams.get("mcp") || (env && env.MCP_URL) || DEFAULT_MCP).trim();
-  const password = (url.searchParams.get("password") || (env && env.MCP_PASSWORD) || DEFAULT_PASSWORD).trim();
+  let activeMcpUrl = dynamicConfig.mcpUrl;
+  let activePassword = dynamicConfig.password;
+
+  if (env && env.CONFIG_KV) {
+    try {
+      const kvConf = await env.CONFIG_KV.get("tunnel_config", "json");
+      if (kvConf?.mcpUrl) activeMcpUrl = kvConf.mcpUrl;
+      if (kvConf?.password) activePassword = kvConf.password;
+    } catch {}
+  } else if (env && env.MCP_URL) {
+    activeMcpUrl = env.MCP_URL;
+  }
+  if (env && env.MCP_PASSWORD) {
+    activePassword = env.MCP_PASSWORD;
+  }
+
+  const mcpUrl = (url.searchParams.get("tunnel") || url.searchParams.get("mcp") || activeMcpUrl || DEFAULT_MCP).trim();
+  const password = (url.searchParams.get("password") || activePassword || DEFAULT_PASSWORD).trim();
   const debug = [];
   const log = (m, d) => debug.push(d ? `${m}: ${d}` : m);
 
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
 
-  // 健康 / 状态
+  if (url.pathname.endsWith("/sync") || url.pathname.endsWith("/update")) {
+    let newTunnel = url.searchParams.get("tunnel") || url.searchParams.get("mcp") || url.searchParams.get("url");
+    let newPassword = url.searchParams.get("password") || url.searchParams.get("pwd");
+
+    if (request.method === "POST") {
+      try {
+        const body = await request.json();
+        if (body.tunnel || body.mcp || body.url) newTunnel = body.tunnel || body.mcp || body.url;
+        if (body.password || body.pwd) newPassword = body.password || body.pwd;
+      } catch {}
+    }
+
+    if (!newTunnel && !newPassword) {
+      return json({
+        ok: false,
+        error: "缺少参数。用法: GET /gateway/sync?tunnel=https://新隧道/mcp&password=新密码",
+        current: { mcpUrl, passwordConfigured: !!password, updatedAt: new Date(dynamicConfig.updatedAt).toISOString() },
+      }, 400);
+    }
+
+    if (newTunnel) {
+      let tUrl = newTunnel.trim();
+      if (!tUrl.startsWith("http")) tUrl = `https://${tUrl}`;
+      if (!tUrl.endsWith("/mcp") && !tUrl.includes("/mcp?")) {
+        tUrl = tUrl.replace(/\/$/, "") + "/mcp";
+      }
+      dynamicConfig.mcpUrl = tUrl;
+    }
+    if (newPassword) {
+      dynamicConfig.password = newPassword.trim();
+    }
+    dynamicConfig.updatedAt = Date.now();
+
+    tokenCache.clear();
+    sessionCache.clear();
+
+    return json({
+      ok: true,
+      message: "🎉 隧道配置已自动同步到云端 Worker!",
+      active: {
+        mcpUrl: dynamicConfig.mcpUrl,
+        password: dynamicConfig.password ? `${dynamicConfig.password.slice(0, 8)}...` : "(未设置)",
+        updatedAt: new Date(dynamicConfig.updatedAt).toISOString(),
+      },
+    });
+  }
+
   if (url.pathname.endsWith("/health")) {
     const cached = tokenCache.get(mcpUrl);
     return json({
       ok: true,
       service: "tunnel-mcp-oauth-gateway",
-      version: "1.5.0",
+      version: "1.6.0",
       mcpUrl,
       passwordConfigured: !!password,
+      lastSyncAt: new Date(dynamicConfig.updatedAt).toISOString(),
       token: cached ? { present: true, expiresInSec: Math.max(0, Math.round((cached.exp - Date.now()) / 1000)) } : { present: false },
-      usage: {
-        listTools: "GET /gateway (自动 OAuth + initialize + tools/list)",
-        callTool: "GET /gateway?tool=<工具名>&args=<JSON参数>",
-        mcpPost: "POST /gateway (标准免认证 MCP 端点)",
-      },
     });
   }
 
-  // 强制重登
-  if (url.pathname.endsWith("/login")) {
-    try {
-      sessionCache.delete(mcpUrl);
-      await getToken(mcpUrl, password, true, log, env);
-      return json({ ok: true, message: "已重新登录并缓存 token", debug });
-    } catch (e) {
-      return json({ ok: false, error: String((e && e.message) || e), debug }, 502);
-    }
-  }
-
-  // ⭐ 当 AI 或浏览器发送 GET 请求到 /gateway 或 /__mcp 时:
-  // 在 Worker 内部自动完成 OAuth + initialize + tools/list 或 tools/call
   if (request.method === "GET") {
     try {
       let token = await getToken(mcpUrl, password, false, log, env);
@@ -403,16 +437,14 @@ async function handleGateway(request, url, env) {
 
       const op = (url.searchParams.get("op") || "").toLowerCase();
       const toolName = url.searchParams.get("tool") || url.searchParams.get("name");
-      const rpcMethod = url.searchParams.get("method");
 
-      // 1) 调用具体工具: GET /gateway?tool=exec_command&args={"cmd":"ls"}
       if (toolName || op === "call") {
-        if (!toolName) return json({ ok: false, error: "缺少 tool 参数,例如 ?tool=exec_command&args={...}" }, 400);
+        if (!toolName) return json({ ok: false, error: "缺少 tool 参数" }, 400);
         let args = {};
         const rawArgs = url.searchParams.get("args");
         if (rawArgs) {
           try { args = JSON.parse(rawArgs); } catch {
-            return json({ ok: false, error: `args 不是合法 JSON: ${rawArgs}` }, 400);
+            return json({ ok: false, error: "args 不是合法 JSON" }, 400);
           }
         }
         let callRes;
@@ -433,18 +465,6 @@ async function handleGateway(request, url, env) {
         });
       }
 
-      // 2) 调用任意 JSON-RPC 方法: GET /gateway?method=tools/list&params={}
-      if (rpcMethod) {
-        let params = {};
-        const rawParams = url.searchParams.get("params");
-        if (rawParams) {
-          try { params = JSON.parse(rawParams); } catch {}
-        }
-        const rRes = await rpcCall(mcpUrl, token, sess.sessionId, rpcMethod, params, 2);
-        return json({ ok: true, method: rpcMethod, sessionId: sess.sessionId, result: rRes.result });
-      }
-
-      // 3) 默认 (GET /gateway 或 GET /gateway?op=connect): 返回完整 serverInfo + tools 列表
       let toolsList;
       try {
         toolsList = await rpcCall(mcpUrl, token, sess.sessionId, "tools/list", {}, 2);
@@ -461,8 +481,6 @@ async function handleGateway(request, url, env) {
         sessionId: sess.sessionId,
         serverInfo: sess.serverInfo,
         tools: toolsList.result?.tools || [],
-        resources: [],
-        prompts: [],
       });
     } catch (e) {
       return json({
@@ -473,7 +491,6 @@ async function handleGateway(request, url, env) {
     }
   }
 
-  // POST 请求: 标准透明转发 MCP 请求 (自动带 Bearer token)
   const bodyBuf = await request.arrayBuffer();
   const doForward = async (token) => {
     const headers = new Headers(request.headers);
@@ -484,19 +501,13 @@ async function handleGateway(request, url, env) {
     headers.set("Authorization", `Bearer ${token}`);
     if (!headers.has("Accept")) headers.set("Accept", "application/json, text/event-stream");
     if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    return fetch(mcpUrl, {
-      method: "POST",
-      headers,
-      body: bodyBuf,
-      redirect: "follow",
-    });
+    return fetch(mcpUrl, { method: "POST", headers, body: bodyBuf, redirect: "follow" });
   };
 
   try {
     let token = await getToken(mcpUrl, password, false, log, env);
     let upstream = await doForward(token);
     if (upstream.status === 401 || upstream.status === 403) {
-      log("上游 401,清缓存重新登录");
       tokenCache.delete(mcpUrl);
       token = await getToken(mcpUrl, password, true, log, env);
       upstream = await doForward(token);
@@ -507,103 +518,23 @@ async function handleGateway(request, url, env) {
     out.set("X-Gateway", "auto-oauth");
     out.delete("content-encoding");
     out.delete("content-length");
-    const ct = upstream.headers.get("content-type") || "";
-    if (ct.includes("text/event-stream")) {
-      out.set("Cache-Control", "no-cache, no-transform");
-      out.set("X-Accel-Buffering", "no");
-    }
     return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out });
   } catch (e) {
-    return json({
-      error: "网关自动登录/转发失败",
-      detail: String((e && e.message) || e),
-      debug,
-    }, 502);
+    return json({ error: "网关转发失败", detail: String((e && e.message) || e), debug }, 502);
   }
-}
-
-/* ============ /__proxy 透明中继(前端用) ============ */
-async function handleProxy(request, url) {
-  if (url.pathname === "/__proxy/health") {
-    return json({
-      ok: true,
-      service: "tunnel-mcp-worker-proxy",
-      version: "1.5.0",
-      gateway: "/gateway",
-      allowedHosts: ALLOWED_HOST_SUFFIX,
-      time: new Date().toISOString(),
-    });
-  }
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-  const target = url.searchParams.get("url");
-  if (!target) return json({ error: "缺少 url 参数" }, 400);
-  let t;
-  try { t = new URL(target); } catch { return json({ error: "url 非法" }, 400); }
-  if (t.protocol !== "https:" && t.protocol !== "http:") return json({ error: "只支持 http/https" }, 400);
-  if (!allowHost(t.hostname)) return json({ error: `拒绝代理到 ${t.hostname}`, allowed: ALLOWED_HOST_SUFFIX }, 403);
-
-  const drop = new Set(["host", "origin", "referer", "connection", "keep-alive", "content-length", "cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor", "x-forwarded-for", "x-forwarded-proto", "x-real-ip"]);
-  const headers = new Headers();
-  for (const [k, v] of request.headers) if (!drop.has(k.toLowerCase())) headers.set(k, v);
-  headers.set("Host", t.host);
-  if (!headers.has("Accept")) headers.set("Accept", "application/json, text/event-stream");
-
-  const init = { method: request.method, headers, redirect: "follow" };
-  if (!["GET", "HEAD"].includes(request.method)) {
-    init.body = request.body;
-    init.duplex = "half";
-  }
-
-  let upstream;
-  const started = Date.now();
-  try {
-    upstream = await fetch(t.toString(), init);
-  } catch (e) {
-    return json({ error: "代理上游失败", target: t.toString(), detail: String((e && e.message) || e) }, 502);
-  }
-
-  const out = new Headers(upstream.headers);
-  for (const [k, v] of Object.entries(CORS)) out.set(k, v);
-  out.set("Access-Control-Expose-Headers", "*");
-  out.set("X-Proxy-Target", t.origin + t.pathname);
-  out.set("X-Proxy-Status", String(upstream.status));
-  out.set("X-Proxy-Ms", String(Date.now() - started));
-  out.delete("content-encoding");
-  out.delete("content-length");
-  const ct = upstream.headers.get("content-type") || "";
-  if (ct.includes("text/event-stream")) {
-    out.set("Cache-Control", "no-cache, no-transform");
-    out.set("X-Accel-Buffering", "no");
-  }
-  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out });
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (
-      url.pathname === "/gateway" ||
-      url.pathname.startsWith("/gateway/") ||
-      url.pathname === "/__mcp" ||
-      url.pathname.startsWith("/__mcp/")
-    ) {
+    if (url.pathname === "/gateway" || url.pathname.startsWith("/gateway/")) {
       return handleGateway(request, url, env);
-    }
-    if (url.pathname === "/__proxy" || url.pathname.startsWith("/__proxy/")) {
-      return handleProxy(request, url);
     }
     if (env && env.ASSETS && typeof env.ASSETS.fetch === "function") {
       const res = await env.ASSETS.fetch(request);
       if (res.status !== 404) return res;
       return env.ASSETS.fetch(new Request(new URL("/", request.url), request));
     }
-    return new Response(
-      "Tunnel MCP Worker v1.5 已运行。\n" +
-      " /gateway                      自动 OAuth 网关 (GET 列工具/调工具, POST 免认证 MCP 端点)\n" +
-      " /gateway?tool=<name>&args={}  GET 直接调用本机 MCP 工具\n" +
-      " /gateway/health               网关状态\n" +
-      " /__proxy?url=..               透明中继\n",
-      { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8", ...CORS } }
-    );
+    return new Response("Tunnel MCP Worker v1.6.0", { headers: { ...CORS } });
   },
 };
