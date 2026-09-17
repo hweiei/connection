@@ -9,20 +9,11 @@ directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 
-# ── 环境变量(非敏感,可写在这里)──────────────────────────
-[vars]
-MCP_URL = "https://affiliates-geek-roger-rides.trycloudflare.com/mcp"
-
-# ── 敏感变量(不要写在这里!用命令行或控制台设置为 Secret)──
-#   npx wrangler secret put MCP_PASSWORD      # OAuth 授权页密码
-#   npx wrangler secret put MCP_TOKEN         # (可选)手动注入的 access_token,跳过自动登录
-#
-# 部署:
+# 部署命令:
 #   npm run build
 #   npx wrangler deploy
 #
 # 部署后:
-#   页面         https://connection.32024755.workers.dev
-#   自动网关     https://connection.32024755.workers.dev/gateway        ← ⭐ AI 直接当 MCP 端点
-#   网关状态     https://connection.32024755.workers.dev/gateway/health
-#   透明中继     https://connection.32024755.workers.dev/__proxy?url=...
+#   页面      https://connection.32024755.workers.dev
+#   代理端点  https://connection.32024755.workers.dev/__proxy?url=...
+#   健康检查  https://connection.32024755.workers.dev/__proxy/health

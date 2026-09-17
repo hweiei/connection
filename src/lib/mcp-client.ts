@@ -68,6 +68,42 @@ export function via(url: string): string {
   if (!PROXY.enabled || !PROXY.base) return url;
   return `${PROXY.base}/__proxy?url=${encodeURIComponent(url)}`;
 }
+/** 通过 Worker 的 /gateway 桥接接口:把单个 GET 请求在 Worker 内部自动转成 OAuth 登录 + MCP POST 握手 */
+export async function autoConnectViaWorkerBridge(opts: {
+  workerBase: string;
+  mcpUrl: string;
+  password: string;
+}): Promise<{
+  ok: boolean;
+  access_token?: string;
+  sessionId?: string;
+  serverInfo?: ServerInfo;
+  tools?: McpTool[];
+  resources?: McpResource[];
+  prompts?: McpPrompt[];
+  error?: string;
+  trace?: any;
+}> {
+  const b = (opts.workerBase || "").replace(/\/$/, "");
+  const u = new URL(`${b}/gateway`);
+  u.searchParams.set("op", "connect");
+  u.searchParams.set("tunnel", opts.mcpUrl);
+  u.searchParams.set("password", opts.password);
+  const r = await fetch(u.toString(), { cache: "no-store" });
+  const data = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+  // 兼容旧版 /gateway 只返回单条 initialize JSON-RPC 的情况
+  if (data && data.result && data.result.serverInfo && !data.ok) {
+    return {
+      ok: true,
+      serverInfo: data.result.serverInfo,
+      tools: [],
+      resources: [],
+      prompts: [],
+    };
+  }
+  return data;
+}
+
 /** 探测某个 Worker 是否部署了代理端点 */
 export async function probeProxy(base: string): Promise<{ ok: boolean; info?: any; error?: string }> {
   const b = (base || "").replace(/\/$/, "");

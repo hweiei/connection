@@ -1,55 +1,49 @@
 /* 服务端修复 & 原生客户端接入的代码片段 */
 
-export function gatewayConfigSnippet(gatewayUrl: string): string {
-  return JSON.stringify(
-    {
-      mcpServers: {
-        "coding-tools": {
-          type: "http",
-          url: gatewayUrl,
-        },
-      },
-    },
-    null, 2,
-  ) + "\n// 不需要任何 Authorization / token —— Worker 网关内部自动完成 OAuth 登录";
-}
-
-export function gatewayCurlSnippet(gatewayUrl: string): string {
-  return `# AI / 命令行直接把 /gateway 当成"免认证"的 MCP 端点
-# Worker 内部会用内置 password 自动登录并加上 token
-
-# 1) 探活(GET 会被网关自动转成 initialize)
-curl -i '${gatewayUrl}'
-
-# 2) 标准 MCP 调用(POST)
-curl -sS '${gatewayUrl}' \\
-  -H 'Content-Type: application/json' \\
-  -H 'Accept: application/json, text/event-stream' \\
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-
-# 查看网关/token 状态
-curl '${gatewayUrl}/health'
-# 强制重新登录
-curl -X POST '${gatewayUrl}/login'`;
-}
-
 export function workerDeploySnippet(workerName = "connection"): string {
-  return `# 1) 在项目根目录确认这两个文件已存在(本项目已自带):
-#      worker/index.js   ← 带 /__proxy 代理路由的 Worker
-#      wrangler.toml     ← name = "${workerName}",[assets] directory = "./dist"
+  return `# ========= 方式 A:在 Cloudflare 后台自动构建(Git 绑定)=========
+# 进入 Workers & Pages → ${workerName} → Settings → Build,两个框分开填:
+#
+#   Build command (构建命令):
+#     npm run build
+#
+#   Deploy command (部署命令):
+#     npx wrangler deploy
+#
+# ⚠️ 不要把两句粘在一起写成 "npm run buildnpx wrangler deploy"!
+# 如果你的界面只有一个命令框,中间必须用 && 连接:
+#     npm run build && npx wrangler deploy
+#
+# 确认仓库根目录已提交这两个文件(本项目已生成):
+#   - wrangler.toml    (name = "${workerName}",main = "worker/index.js",[assets] directory = "./dist")
+#   - worker/index.js  (带 /__proxy 与 /__proxy/health 路由)
 
-# 2) 构建前端 + 部署 Worker(一条龙)
+# ========= 方式 B:在本机终端手动部署 =========
 npm install
 npm run build
 npx wrangler deploy
 
-# 3) 验证代理是否生效(应返回 JSON,而不是 HTML)
+# ========= 部署后验证(应返回 JSON,而不是 HTML)=========
 curl https://${workerName}.32024755.workers.dev/__proxy/health
+# 期望输出: {"ok":true,"service":"tunnel-mcp-worker-proxy","version":"1.0.0",...}`;
+}
 
-# 期望输出:
-# {"ok":true,"service":"tunnel-mcp-worker-proxy","version":"1.0.0",...}
+export function workerAiBridgeSnippet(workerBase: string, mcpUrl: string, password: string): string {
+  const b = (workerBase || "https://connection.32024755.workers.dev").replace(/\/$/, "");
+  const encMcp = encodeURIComponent(mcpUrl);
+  const encPwd = encodeURIComponent(password);
+  return `# ========= AI / 浏览器 GET → OAuth 登录 + MCP POST 全自动桥接 =========
+# 1) 连接并列出所有 MCP 工具 (单个 GET 请求自动完成 OAuth 登录 + initialize + tools/list):
+${b}/__mcp?op=connect
 
-# 4) 回到页面点「探测代理状态」,变成「已启用」即大功告成`;
+# 2) 指定隧道与密码连接:
+${b}/__mcp?op=connect&tunnel=${encMcp}&password=${encPwd}
+
+# 3) 用 GET 请求直接调用本机 MCP 工具 (Worker 自动转成 POST tools/call):
+${b}/__mcp?op=call&tool=<工具名>&args=${encodeURIComponent('{"path":"."}')}
+
+# 4) 仅自动获取 OAuth access_token:
+${b}/__mcp?op=token`;
 }
 
 export function workerProxyTestSnippet(workerBase: string, mcpUrl: string): string {
