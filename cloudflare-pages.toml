@@ -1,0 +1,12 @@
+# Cloudflare Pages 配置
+# 部署后访问: https://<项目名>.pages.dev
+
+# 静态文件目录
+build.command = "npm run build"
+build.output = "dist"
+
+# 根目录重定向到 index.html (SPA 支持)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
