@@ -1,0 +1,19 @@
+name = "connection"
+main = "worker/index.js"
+compatibility_date = "2024-11-06"
+compatibility_flags = ["nodejs_compat"]
+
+# 静态资源: 构建产物 dist/ 由 Worker 托管
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# 部署命令:
+#   npm run build
+#   npx wrangler deploy
+#
+# 部署后:
+#   页面      https://connection.32024755.workers.dev
+#   代理端点  https://connection.32024755.workers.dev/__proxy?url=...
+#   健康检查  https://connection.32024755.workers.dev/__proxy/health

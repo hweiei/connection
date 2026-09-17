@@ -46,6 +46,48 @@ export class McpAuthRequiredError extends Error {
   }
 }
 
+/* ============ Worker 代理(服务端中继) ============
+ * 浏览器 →(同源)→ Cloudflare Worker →(服务端直连)→ trycloudflare 隧道
+ * 彻底绕开 CORS,因为真正发起跨域请求的是 Worker 而不是浏览器。
+ */
+export interface ProxyConfig {
+  enabled: boolean;
+  base: string; // 例如 https://connection.32024755.workers.dev
+}
+
+let PROXY: ProxyConfig = { enabled: false, base: "" };
+
+export function setProxy(cfg: ProxyConfig) {
+  PROXY = { enabled: !!cfg.enabled && !!cfg.base, base: (cfg.base || "").replace(/\/$/, "") };
+}
+export function getProxy(): ProxyConfig {
+  return PROXY;
+}
+/** 把目标地址包装成走 Worker 代理的地址 */
+export function via(url: string): string {
+  if (!PROXY.enabled || !PROXY.base) return url;
+  return `${PROXY.base}/__proxy?url=${encodeURIComponent(url)}`;
+}
+/** 探测某个 Worker 是否部署了代理端点 */
+export async function probeProxy(base: string): Promise<{ ok: boolean; info?: any; error?: string }> {
+  const b = (base || "").replace(/\/$/, "");
+  if (!b) return { ok: false, error: "未填写 Worker 地址" };
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    const r = await fetch(`${b}/__proxy/health`, { signal: ctl.signal, cache: "no-store" });
+    clearTimeout(t);
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status} —— Worker 在线但没有 /__proxy 路由,需要部署带代理的新版 worker/index.js` };
+    const ct = r.headers.get("content-type") || "";
+    if (!ct.includes("json")) return { ok: false, error: "返回的不是 JSON(可能命中了 SPA 回退),说明 Worker 还没加代理路由" };
+    const info = await r.json();
+    if (!info?.ok) return { ok: false, error: "健康检查返回异常" };
+    return { ok: true, info };
+  } catch (e: any) {
+    return { ok: false, error: e?.name === "AbortError" ? "探测超时" : String(e?.message || e) };
+  }
+}
+
 function parseSSE(text: string): any[] {
   const messages: any[] = [];
   const lines = text.split(/\r?\n/);
@@ -127,7 +169,7 @@ export class McpClient {
 
     let res: Response;
     try {
-      res = await fetch(this.url, {
+      res = await fetch(via(this.url), {
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -136,8 +178,12 @@ export class McpClient {
     } catch (e: any) {
       clearTimeout(timeout);
       if (e?.name === "AbortError") throw new Error("请求超时(60s),请检查隧道是否在线");
+      const p = getProxy();
       throw new Error(
-        `网络请求失败: ${e?.message || e}\n\n可能原因:\n1. 隧道已过期/掉线(trycloudflare 链接是临时的)\n2. 浏览器 CORS 被拦截 —— 需要服务端允许跨域\n3. 目标地址需要 VPN/内网环境`
+        `网络请求失败: ${e?.message || e}\n\n` +
+        (p.enabled
+          ? `当前已启用 Worker 代理(${p.base}),失败可能是:\n1. Worker 未部署 /__proxy 路由\n2. 隧道已掉线,Worker 也连不上\n3. 目标主机不在 Worker 白名单内`
+          : `可能原因:\n1. 隧道已过期/掉线(trycloudflare 链接是临时的)\n2. 浏览器 CORS 被拦截 —— 建议开启 Worker 代理模式\n3. 目标地址需要 VPN/内网环境`)
       );
     } finally {
       clearTimeout(timeout);
@@ -227,7 +273,7 @@ export class McpClient {
     if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
     this.log("request", `→ ${method} (notification)`, JSON.stringify(body));
     try {
-      const res = await fetch(this.url, { method: "POST", headers, body: JSON.stringify(body) });
+      const res = await fetch(via(this.url), { method: "POST", headers, body: JSON.stringify(body) });
       const sid = res.headers.get("mcp-session-id") || res.headers.get("Mcp-Session-Id");
       if (sid && !this.sessionId) {
         this.sessionId = sid;
@@ -388,11 +434,13 @@ export async function runDiagnostics(
   onStep: (steps: DiagStep[]) => void,
 ): Promise<DiagResult> {
   const origin = getOrigin(mcpUrl);
+  const px = getProxy();
+  const viaTxt = px.enabled ? "经 Worker 代理" : "浏览器直连";
   const steps: DiagStep[] = [
-    { id: "reach", title: "隧道可达性(Cloudflare 边缘 → 你的本机)", state: "pending" },
-    { id: "cors", title: "浏览器跨域(CORS)能否读取服务端响应", state: "pending" },
+    { id: "reach", title: `隧道可达性(${viaTxt})`, state: "pending" },
+    { id: "cors", title: px.enabled ? "Worker 代理链路(已绕开 CORS)" : "浏览器跨域(CORS)能否读取服务端响应", state: "pending" },
     { id: "meta", title: "OAuth 授权服务器元数据", state: "pending" },
-    { id: "mcp", title: "MCP 端点握手(POST initialize,未带 token)", state: "pending" },
+    { id: "mcp", title: `MCP 端点握手(POST initialize,未带 token,${viaTxt})`, state: "pending" },
   ];
   const emit = () => onStep(steps.map((s) => ({ ...s })));
   const set = (id: string, patch: Partial<DiagStep>) => {
@@ -408,10 +456,20 @@ export async function runDiagnostics(
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 12000);
-    await fetch(metaUrl, { mode: "no-cors", cache: "no-store", signal: ctl.signal });
+    if (px.enabled) {
+      const r = await fetch(via(metaUrl), { cache: "no-store", signal: ctl.signal });
+      reachable = r.status !== 502;
+      if (!reachable) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error((j as any)?.detail || "Worker 报告上游不可达(502)");
+      }
+      set("reach", { state: "ok", detail: `Worker(${px.base})成功连到 ${origin},耗时 ${r.headers.get("x-proxy-ms") || "?"}ms` });
+    } else {
+      await fetch(metaUrl, { mode: "no-cors", cache: "no-store", signal: ctl.signal });
+      reachable = true;
+      set("reach", { state: "ok", detail: `${origin} 有 HTTP 响应` });
+    }
     clearTimeout(t);
-    reachable = true;
-    set("reach", { state: "ok", detail: `${origin} 有 HTTP 响应` });
   } catch (e: any) {
     set("reach", { state: "fail", detail: e?.name === "AbortError" ? "12 秒无响应(隧道可能已掉线)" : `无法建立连接: ${e?.message || e}` });
   }
@@ -421,9 +479,14 @@ export async function runDiagnostics(
   let corsOk = false;
   let metadata: any = null;
   try {
-    const r = await fetch(metaUrl, { cache: "no-store", headers: { Accept: "application/json" } });
+    const r = await fetch(via(metaUrl), { cache: "no-store", headers: { Accept: "application/json" } });
     corsOk = true;
-    set("cors", { state: "ok", detail: `响应可读(HTTP ${r.status}),服务端已返回 Access-Control-Allow-Origin` });
+    set("cors", {
+      state: "ok",
+      detail: px.enabled
+        ? `走 Worker 同源请求,浏览器不再受 CORS 限制(HTTP ${r.status})`
+        : `响应可读(HTTP ${r.status}),服务端已返回 Access-Control-Allow-Origin`,
+    });
     set("meta", { state: "running" });
     if (r.ok) {
       const txt = await r.text();
@@ -443,9 +506,11 @@ export async function runDiagnostics(
   } catch (e: any) {
     set("cors", {
       state: reachable ? "fail" : "warn",
-      detail: reachable
-        ? "服务端有响应,但浏览器读不到 —— 响应缺少 Access-Control-Allow-Origin 头(CORS 未开启)"
-        : "无法连接,跳过",
+      detail: px.enabled
+        ? `经 Worker 代理仍失败: ${e?.message || e}`
+        : reachable
+          ? "服务端有响应,但浏览器读不到 —— 响应缺少 Access-Control-Allow-Origin 头(CORS 未开启)。开启 Worker 代理即可绕开。"
+          : "无法连接,跳过",
     });
     set("meta", { state: "warn", detail: "因 CORS/网络原因无法读取" });
   }
@@ -457,7 +522,7 @@ export async function runDiagnostics(
   let mcpCorsOk = false;
   let exposeSession = false;
   try {
-    const r = await fetch(mcpUrl, {
+    const r = await fetch(via(mcpUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
       body: JSON.stringify({
@@ -488,11 +553,13 @@ export async function runDiagnostics(
   } catch (e: any) {
     set("mcp", {
       state: "fail",
-      detail: corsOk
-        ? "well-known 可读,但 /mcp 的 POST 跨域失败 —— 常见原因:① 服务端 OPTIONS 预检未处理 ② 401 响应缺少 CORS 头(认证中间件排在 CORS 中间件之前)"
-        : reachable
-          ? "跨域被拦截(CORS 未开启),浏览器无法读取 /mcp 的响应"
-          : `无法连接: ${e?.message || e}`,
+      detail: px.enabled
+        ? `经 Worker 代理请求 /mcp 失败: ${e?.message || e}`
+        : corsOk
+          ? "well-known 可读,但 /mcp 的 POST 跨域失败 —— 常见原因:① 服务端 OPTIONS 预检未处理 ② 401 响应缺少 CORS 头(认证中间件排在 CORS 中间件之前)。开启 Worker 代理可直接绕开。"
+          : reachable
+            ? "跨域被拦截(CORS 未开启),浏览器无法读取 /mcp 的响应。开启 Worker 代理即可绕开。"
+            : `无法连接: ${e?.message || e}`,
     });
   }
 
@@ -521,7 +588,7 @@ export async function discoverOAuth(mcpUrl: string, log?: (m: string, d?: string
   for (const c of candidates) {
     try {
       log?.(`发现保护资源元数据: ${c}`);
-      const r = await fetch(c, { headers: { Accept: "application/json" } });
+      const r = await fetch(via(c), { headers: { Accept: "application/json" } });
       if (r.ok) {
         prm = await r.json();
         prmUrl = c;
@@ -546,7 +613,7 @@ export async function discoverOAuth(mcpUrl: string, log?: (m: string, d?: string
   for (const c of metaCandidates) {
     try {
       log?.(`发现授权服务器元数据: ${c}`);
-      const r = await fetch(c, { headers: { Accept: "application/json" } });
+      const r = await fetch(via(c), { headers: { Accept: "application/json" } });
       if (r.ok) {
         asm = await r.json();
         corsBlocked = false;
@@ -590,7 +657,7 @@ export async function registerClient(
     response_types: ["code"],
     token_endpoint_auth_method: "none",
   };
-  const r = await fetch(registrationEndpoint, {
+  const r = await fetch(via(registrationEndpoint), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),
@@ -640,7 +707,7 @@ export async function exchangeCode(opts: {
   if (opts.clientSecret) body.set("client_secret", opts.clientSecret);
   body.set("code_verifier", opts.codeVerifier);
   if (opts.resource) body.set("resource", opts.resource);
-  const r = await fetch(opts.tokenEndpoint, {
+  const r = await fetch(via(opts.tokenEndpoint), {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
     body: body.toString(),

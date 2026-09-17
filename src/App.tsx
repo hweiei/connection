@@ -5,7 +5,7 @@ import {
   Play, Loader2, ShieldCheck, Globe, Server, Activity, Search, Zap, ChevronRight,
   KeyRound, Eye, EyeOff, RefreshCw, X, Sparkles, ArrowRight, Radio, Stethoscope,
   Lock, CircleCheck, TriangleAlert, Info, Trash2, Download, ExternalLink, Braces, ListTree,
-  CircleDashed, XCircle, ClipboardPaste, MonitorSmartphone, Code2, LifeBuoy, PartyPopper,
+  CircleDashed, XCircle, ClipboardPaste, MonitorSmartphone, Code2, LifeBuoy, PartyPopper, Cloud,
 } from "lucide-react";
 import {
   McpClient, McpAuthRequiredError, McpTool, McpResource, McpPrompt,
@@ -13,16 +13,29 @@ import {
   discoverOAuth, registerClient, buildAuthorizeUrl, exchangeCode,
   randomString, pkceChallenge, getOrigin, runDiagnostics, classifyError,
   parseCallbackInput, savePkce, loadPkce, clearPkce, isHttpOrigin, OAUTH_RESULT_KEY,
+  setProxy, probeProxy,
 } from "./lib/mcp-client";
 import {
   pythonCorsSnippet, nodeCorsSnippet, claudeCodeCmd, inspectorCmd,
   cursorConfig, claudeDesktopConfig, tokenConfig, curlSnippet,
+  workerDeploySnippet, workerProxyTestSnippet,
 } from "./lib/snippets";
 
 /* ============ 预填:用户提供的隧道信息 ============ */
 const DEFAULT_TUNNEL = "https://affiliates-geek-roger-rides.trycloudflare.com";
 const DEFAULT_MCP = "https://affiliates-geek-roger-rides.trycloudflare.com/mcp";
 const DEFAULT_PASSWORD = "hQ3mUUJtRsDG8UCC_knqkBIM2rGby1BFhOJm8bOJSdA";
+/** 你的 Cloudflare Worker —— 同时托管本页面并充当服务端代理 */
+const DEFAULT_WORKER = "https://connection.32024755.workers.dev";
+/** 当前页面就跑在 Worker 上时,直接用同源地址 */
+function guessWorkerBase(): string {
+  try {
+    if (/^https?:$/.test(location.protocol) && /\.workers\.dev$/.test(location.hostname)) {
+      return location.origin;
+    }
+  } catch {}
+  return DEFAULT_WORKER;
+}
 
 type Status = "disconnected" | "connecting" | "connected" | "auth_required" | "error";
 
@@ -158,6 +171,13 @@ export default function App() {
   const [promptLoading, setPromptLoading] = useState<string | null>(null);
   const [lastError, setLastError] = useState<{ kind: string; msg: string } | null>(null);
 
+  // Worker 代理
+  const [workerBase, setWorkerBase] = useState(guessWorkerBase());
+  const [proxyOn, setProxyOn] = useState(true);
+  const [proxyState, setProxyState] = useState<"unknown" | "checking" | "ready" | "missing">("unknown");
+  const [proxyErr, setProxyErr] = useState("");
+  const [proxyInfo, setProxyInfo] = useState<any>(null);
+
   // 诊断
   const [diagSteps, setDiagSteps] = useState<DiagStep[]>([]);
   const [diag, setDiag] = useState<DiagResult | null>(null);
@@ -174,7 +194,7 @@ export default function App() {
   const [cb, setCb] = useState<{ phase: "exchanging" | "success" | "error"; msg: string; token?: string } | null>(null);
 
   // 修复指南
-  const [fixTab, setFixTab] = useState<"py" | "node" | "claude" | "inspector" | "cursor" | "desktop" | "curl">("py");
+  const [fixTab, setFixTab] = useState<"worker" | "py" | "node" | "claude" | "inspector" | "cursor" | "desktop" | "curl">("worker");
   const fixRef = useRef<HTMLDivElement>(null);
 
   const clientRef = useRef<McpClient | null>(null);
@@ -195,6 +215,32 @@ export default function App() {
     if (usePwdAsToken && password.trim()) return password.trim();
     return null;
   }, [token, usePwdAsToken, password]);
+
+  /* 让底层 fetch 始终使用最新的代理设置 */
+  useEffect(() => {
+    setProxy({ enabled: proxyOn && proxyState === "ready", base: workerBase });
+  }, [proxyOn, proxyState, workerBase]);
+
+  /* 探测 Worker 代理是否可用 */
+  const checkProxy = useCallback(async (silent = false) => {
+    setProxyState("checking");
+    setProxyErr("");
+    if (!silent) addLog("info", `探测 Worker 代理: ${workerBase}/__proxy/health`);
+    const r = await probeProxy(workerBase);
+    if (r.ok) {
+      setProxyState("ready");
+      setProxyInfo(r.info);
+      addLog("success", `✓ Worker 代理可用 —— 之后所有请求都由 Worker 服务端转发,不再受 CORS 限制`, JSON.stringify(r.info, null, 2));
+      return true;
+    }
+    setProxyState("missing");
+    setProxyErr(r.error || "未知错误");
+    addLog("warn", `Worker 代理不可用: ${r.error}`);
+    return false;
+  }, [workerBase, addLog]);
+
+  const checkProxyRef = useRef(checkProxy);
+  useEffect(() => { checkProxyRef.current = checkProxy; }, [checkProxy]);
 
   /* ---------- 连接 ---------- */
   const connect = useCallback(async (tokenOverride?: string | null) => {
@@ -441,12 +487,16 @@ export default function App() {
       return;
     }
 
-    // 主窗口:欢迎 + 自动诊断
+    // 主窗口:欢迎 → 探测 Worker 代理 → 自动诊断
     addLog("info", "欢迎使用 Tunnel MCP 控制台 🚇");
     addLog("info", `隧道: ${DEFAULT_TUNNEL}`);
     addLog("info", `MCP 端点: ${DEFAULT_MCP}`);
+    addLog("info", `Worker 中继: ${guessWorkerBase()}`);
     addLog("info", "已知服务端信息:OAuth 端点 /oauth/authorize、/oauth/token、/oauth/register,仅支持 authorization_code");
-    const t = setTimeout(() => doDiagnose(true), 500);
+    const t = setTimeout(async () => {
+      await checkProxyRef.current(false);
+      doDiagnose(true);
+    }, 400);
 
     // 监听回调窗口回传的 token
     const onStorage = (e: StorageEvent) => {
@@ -581,11 +631,11 @@ export default function App() {
     const base = { cls: "", icon: Info, title: "", desc: "", primary: null as null | { label: string; onClick: () => void; icon: any }, secondary: null as null | { label: string; onClick: () => void } };
     switch (v) {
       case "unreachable":
-        return { ...base, cls: "border-rose-400/30 bg-rose-500/10", icon: XCircle, title: "隧道不可达", desc: "浏览器完全连不上这个地址。trycloudflare 隧道是临时的:请到本机终端确认 cloudflared 和 coding-tools-mcp 两个进程都还在运行。如果重启过隧道,地址会变,需要把新地址填到上面的输入框。", primary: { label: "重新诊断", onClick: () => doDiagnose(), icon: RefreshCw }, secondary: { label: "查看原生客户端方案", onClick: () => scrollToFix("claude") } };
+        return { ...base, cls: "border-rose-400/30 bg-rose-500/10", icon: XCircle, title: "隧道不可达", desc: proxyState === "ready" ? "Worker 代理已启用,但它也连不上你的隧道 —— 说明隧道本身掉线了。请到本机终端确认 cloudflared 和 coding-tools-mcp 两个进程都还在运行;重启过隧道的话地址会变,需要更新上面的 MCP 端点。" : "浏览器完全连不上这个地址。trycloudflare 隧道是临时的:请确认本机 cloudflared 和 coding-tools-mcp 进程都在运行。也可能是 CORS 导致的假象 —— 建议先部署 Worker 代理再判断。", primary: { label: "重新诊断", onClick: () => doDiagnose(), icon: RefreshCw }, secondary: { label: "部署 Worker 代理", onClick: () => scrollToFix("worker") } };
       case "cors_blocked":
-        return { ...base, cls: "border-amber-400/30 bg-amber-500/10", icon: TriangleAlert, title: "服务端没开 CORS,浏览器被拦住了", desc: "服务器是有响应的(隧道正常、密码也没问题),但响应里缺少 Access-Control-Allow-Origin 头,浏览器出于安全策略拒绝把内容交给网页。这就是「连不上」的原因。两条路:① 在 coding-tools-mcp 服务端加 CORS 中间件(下方有现成代码);② 用 Claude Code / Cursor / MCP Inspector 这类原生客户端,它们不受 CORS 限制。", primary: { label: "查看服务端修复代码", onClick: () => scrollToFix("py"), icon: Code2 }, secondary: { label: "重新诊断", onClick: () => doDiagnose() } };
+        return { ...base, cls: "border-amber-400/30 bg-amber-500/10", icon: TriangleAlert, title: "浏览器被 CORS 拦住了 —— 用 Worker 代理一键绕开", desc: `服务器是有响应的(隧道正常、密码也没问题),但响应缺少 Access-Control-Allow-Origin 头,浏览器拒绝把内容交给网页。最快的解法不是改服务端,而是让你已有的 Worker(${workerBase.replace(/^https?:\/\//, "")})去代你连接隧道 —— 服务端之间没有 CORS 限制。`, primary: { label: "部署 Worker 代理", onClick: () => scrollToFix("worker"), icon: Cloud }, secondary: { label: "改服务端 CORS", onClick: () => scrollToFix("py") } };
       case "mcp_cors_blocked":
-        return { ...base, cls: "border-amber-400/30 bg-amber-500/10", icon: TriangleAlert, title: "元数据能读,但 /mcp 端点跨域失败", desc: "通常是服务端没处理 OPTIONS 预检请求,或者 401 响应没带 CORS 头(认证中间件排在 CORS 中间件前面)。你可以先试试 OAuth 授权 —— 带上有效 token 后请求可能就通了;不行的话按下方代码修一下服务端。", primary: { label: "开始 OAuth 授权", onClick: startOAuth, icon: ShieldCheck }, secondary: { label: "查看服务端修复代码", onClick: () => scrollToFix("py") } };
+        return { ...base, cls: "border-amber-400/30 bg-amber-500/10", icon: TriangleAlert, title: "元数据能读,但 /mcp 端点跨域失败", desc: "通常是服务端没处理 OPTIONS 预检,或 401 响应没带 CORS 头(认证中间件排在 CORS 中间件前面)。开启 Worker 代理可以直接绕开这个问题,无需改服务端。", primary: { label: "部署 Worker 代理", onClick: () => scrollToFix("worker"), icon: Cloud }, secondary: { label: "先试试 OAuth 授权", onClick: startOAuth } };
       case "auth_required":
         return { ...base, cls: "border-cyan-400/30 bg-cyan-500/10", icon: ShieldCheck, title: "链路一切正常,只差 OAuth 授权", desc: "服务端返回 401 —— 这正是「连不上」的原因:那串 password 不是 token,不能直接塞进请求头。它是在 /oauth/authorize 登录页里输入的密码。点击下方按钮 → 在弹出的页面输入 password → 系统自动换取 access_token 并连接。", primary: { label: "开始 OAuth 授权", onClick: startOAuth, icon: ShieldCheck }, secondary: null };
       case "open":
@@ -658,11 +708,14 @@ export default function App() {
           </div>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-[15px] font-bold tracking-tight text-white sm:text-base">
-              Tunnel MCP 控制台 <span className="ml-1 hidden rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium text-cyan-300 sm:inline">v1.1</span>
+              Tunnel MCP 控制台 <span className="ml-1 hidden rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium text-cyan-300 sm:inline">v1.2</span>
             </h1>
             <p className="code-font truncate text-[11px] text-slate-500">{mcpUrl}</p>
           </div>
           <div className="hidden items-center gap-2 md:flex">
+            <span className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium ${proxyState === "ready" ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : "border-white/10 bg-white/5 text-slate-400"}`}>
+              <Cloud size={13} /> {proxyState === "ready" ? "Worker 中继" : "直连模式"}
+            </span>
             {latency !== null && status === "connected" && (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300">
                 <Activity size={13} className="text-emerald-400" /> {latency}ms
@@ -729,6 +782,58 @@ export default function App() {
       <main className="mx-auto grid max-w-[1440px] gap-4 px-4 py-4 sm:px-6 lg:grid-cols-[380px_1fr]">
         {/* ===== 左列 ===== */}
         <div className="space-y-4">
+          {/* Worker 服务端中继 */}
+          <motion.section initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} className={`glass rounded-2xl border p-4 ${proxyState === "ready" ? "border-emerald-400/30" : proxyState === "missing" ? "border-amber-400/30" : "border-white/10"}`}>
+            <div className="flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-bold text-white"><Cloud size={15} className="text-emerald-400" /> Worker 服务端中继</h2>
+              <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium ${proxyState === "ready" ? "bg-emerald-400/15 text-emerald-300" : proxyState === "checking" ? "bg-amber-400/15 text-amber-300" : proxyState === "missing" ? "bg-amber-500/15 text-amber-300" : "bg-white/8 text-slate-400"}`}>
+                {proxyState === "checking" ? <Loader2 size={11} className="animate-spin" /> : proxyState === "ready" ? <CircleCheck size={11} /> : proxyState === "missing" ? <TriangleAlert size={11} /> : <CircleDashed size={11} />}
+                {proxyState === "ready" ? "已启用" : proxyState === "checking" ? "探测中" : proxyState === "missing" ? "需部署" : "未知"}
+              </span>
+            </div>
+
+            <div className="mt-2.5 flex items-center justify-center gap-1.5 rounded-xl border border-white/8 bg-black/30 px-2 py-2.5 text-[10.5px]">
+              <span className="rounded-md bg-white/8 px-2 py-1 text-slate-300">浏览器</span>
+              <ArrowRight size={11} className={proxyState === "ready" ? "text-emerald-400" : "text-slate-600"} />
+              <span className={`rounded-md px-2 py-1 ${proxyState === "ready" ? "bg-emerald-400/15 text-emerald-300" : "bg-white/8 text-slate-400"}`}>Worker</span>
+              <ArrowRight size={11} className={proxyState === "ready" ? "text-emerald-400" : "text-slate-600"} />
+              <span className="rounded-md bg-white/8 px-2 py-1 text-slate-300">CF 隧道</span>
+            </div>
+
+            <div className="mt-3 space-y-2.5">
+              <div>
+                <label className="mb-1.5 flex items-center justify-between text-[11px] font-medium text-slate-400">Worker 地址 <CopyBtn text={workerBase} /></label>
+                <input value={workerBase} onChange={(e) => { setWorkerBase(e.target.value); setProxyState("unknown"); }} spellCheck={false} className="code-font w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2.5 text-[12.5px] text-slate-100" />
+              </div>
+              <label className="flex cursor-pointer items-center justify-between rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2.5">
+                <span className="text-[12px] text-slate-300">启用代理(强烈推荐)</span>
+                <button onClick={() => setProxyOn(!proxyOn)} className={`relative h-5 w-9 shrink-0 rounded-full transition ${proxyOn ? "bg-emerald-400" : "bg-white/15"}`}>
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${proxyOn ? "left-[18px]" : "left-0.5"}`} />
+                </button>
+              </label>
+              <button onClick={() => checkProxy(false)} disabled={proxyState === "checking"} className="flex w-full items-center justify-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-4 py-2.5 text-[13px] font-semibold text-emerald-200 transition hover:bg-emerald-500/20 disabled:opacity-60">
+                {proxyState === "checking" ? <Loader2 size={15} className="animate-spin" /> : <Radio size={15} />} 探测代理状态
+              </button>
+
+              {proxyState === "ready" && (
+                <div className="rounded-xl border border-emerald-400/25 bg-emerald-500/8 p-3 text-[11.5px] leading-relaxed text-emerald-100">
+                  ✅ Worker 正在替你连接 CF 隧道。浏览器只和同源的 Worker 通信,<b>CORS 问题已彻底消失</b>。
+                  {proxyInfo?.allowedHosts && <div className="code-font mt-1.5 text-[10.5px] text-emerald-200/70">白名单: {proxyInfo.allowedHosts.join(" · ")}</div>}
+                </div>
+              )}
+              {proxyState === "missing" && (
+                <div className="rounded-xl border border-amber-400/25 bg-amber-500/8 p-3 text-[11.5px] leading-relaxed text-amber-100">
+                  <p className="font-semibold">Worker 上还没有代理路由</p>
+                  <p className="mt-1 text-amber-200/80">{proxyErr}</p>
+                  <p className="mt-1.5">把项目里的 <span className="code-font">worker/index.js</span> + <span className="code-font">wrangler.toml</span> 部署上去即可:</p>
+                  <button onClick={() => scrollToFix("worker")} className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-400/20 px-3 py-1.5 text-[11.5px] font-semibold text-amber-100 hover:bg-amber-400/30">
+                    <Code2 size={12} /> 查看部署步骤
+                  </button>
+                </div>
+              )}
+            </div>
+          </motion.section>
+
           {/* 连接设置 */}
           <motion.section initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 }} className="glass rounded-2xl border border-white/10 p-4">
             <h2 className="flex items-center gap-2 text-sm font-bold text-white"><Server size={15} className="text-cyan-400" /> 连接设置</h2>
@@ -1147,6 +1252,7 @@ export default function App() {
           </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
             {([
+              { id: "worker", label: "⭐ 部署 Worker 代理", icon: Cloud },
               { id: "py", label: "服务端加 CORS(Python)", icon: Code2 },
               { id: "node", label: "服务端加 CORS(Node)", icon: Code2 },
               { id: "claude", label: "Claude Code", icon: MonitorSmartphone },
@@ -1162,6 +1268,12 @@ export default function App() {
           </div>
           <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_320px]">
             <div>
+              {fixTab === "worker" && (
+                <div className="space-y-2">
+                  <CodeBlock code={workerDeploySnippet()} maxHeight={300} />
+                  <CodeBlock code={workerProxyTestSnippet(workerBase, mcpUrl)} maxHeight={220} />
+                </div>
+              )}
               {fixTab === "py" && <CodeBlock code={pythonCorsSnippet()} />}
               {fixTab === "node" && <CodeBlock code={nodeCorsSnippet()} />}
               {fixTab === "claude" && <CodeBlock code={claudeCodeCmd(mcpUrl)} maxHeight={160} />}
@@ -1171,6 +1283,22 @@ export default function App() {
               {fixTab === "curl" && <CodeBlock code={curlSnippet(mcpUrl, token || null)} maxHeight={200} />}
             </div>
             <div className="space-y-2 text-[12px] leading-relaxed text-slate-400">
+              {fixTab === "worker" && (
+                <>
+                  <p className="font-semibold text-slate-200">这是最推荐的方案 ⭐</p>
+                  <p>你的 Worker <span className="code-font text-slate-300">{workerBase.replace(/^https?:\/\//, "")}</span> 已经在托管这个页面。只要再给它加一个 <span className="code-font text-slate-300">/__proxy</span> 路由,它就能<b>替浏览器去连你的 CF 隧道</b>。</p>
+                  <div className="rounded-lg border border-emerald-400/25 bg-emerald-400/8 p-2.5 text-[11.5px] text-emerald-100">
+                    <p className="font-semibold">为什么这样就不会被 CORS 拦?</p>
+                    <p className="mt-1">浏览器只向<b>同源</b>的 Worker 发请求(不触发跨域检查);真正的跨域请求由 Worker 在 Cloudflare 边缘发起,<b>服务端之间没有 CORS 概念</b>。所以完全不用改你的 MCP 服务端。</p>
+                  </div>
+                  <ul className="list-disc space-y-1 pl-4">
+                    <li>SSE 流式响应已做透传,不缓冲</li>
+                    <li>自动暴露 <span className="code-font">Mcp-Session-Id</span> 等响应头</li>
+                    <li>内置域名白名单,避免变成公开代理被滥用</li>
+                  </ul>
+                  <p className="text-slate-500">部署完点左侧「探测代理状态」,显示「已启用」就成功了。</p>
+                </>
+              )}
               {(fixTab === "py" || fixTab === "node") && (
                 <>
                   <p className="font-semibold text-slate-200">为什么需要这个?</p>

@@ -1,5 +1,38 @@
 /* 服务端修复 & 原生客户端接入的代码片段 */
 
+export function workerDeploySnippet(workerName = "connection"): string {
+  return `# 1) 在项目根目录确认这两个文件已存在(本项目已自带):
+#      worker/index.js   ← 带 /__proxy 代理路由的 Worker
+#      wrangler.toml     ← name = "${workerName}",[assets] directory = "./dist"
+
+# 2) 构建前端 + 部署 Worker(一条龙)
+npm install
+npm run build
+npx wrangler deploy
+
+# 3) 验证代理是否生效(应返回 JSON,而不是 HTML)
+curl https://${workerName}.32024755.workers.dev/__proxy/health
+
+# 期望输出:
+# {"ok":true,"service":"tunnel-mcp-worker-proxy","version":"1.0.0",...}
+
+# 4) 回到页面点「探测代理状态」,变成「已启用」即大功告成`;
+}
+
+export function workerProxyTestSnippet(workerBase: string, mcpUrl: string): string {
+  const target = encodeURIComponent(mcpUrl);
+  return `# 通过 Worker 代理直接握手 MCP(服务端转发,不受 CORS 影响)
+curl -i '${workerBase}/__proxy?url=${target}' \\
+  -H 'Content-Type: application/json' \\
+  -H 'Accept: application/json, text/event-stream' \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+
+# 响应头里会带:
+#   X-Proxy-Target : 实际请求到的目标
+#   X-Proxy-Status : 上游返回的状态码
+#   X-Proxy-Ms     : Worker → 隧道 的耗时`;
+}
+
 export function pythonCorsSnippet(): string {
   return `# coding-tools-mcp 若基于 Starlette / FastAPI / FastMCP(uvicorn 8000 端口)
 # 在创建 app 之后加上 CORS 中间件 —— 注意必须放在认证中间件的"外层"
