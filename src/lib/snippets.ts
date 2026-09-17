@@ -1,5 +1,38 @@
 /* 服务端修复 & 原生客户端接入的代码片段 */
 
+export function gatewayConfigSnippet(gatewayUrl: string): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        "coding-tools": {
+          type: "http",
+          url: gatewayUrl,
+        },
+      },
+    },
+    null, 2,
+  ) + "\n// 不需要任何 Authorization / token —— Worker 网关内部自动完成 OAuth 登录";
+}
+
+export function gatewayCurlSnippet(gatewayUrl: string): string {
+  return `# AI / 命令行直接把 /gateway 当成"免认证"的 MCP 端点
+# Worker 内部会用内置 password 自动登录并加上 token
+
+# 1) 探活(GET 会被网关自动转成 initialize)
+curl -i '${gatewayUrl}'
+
+# 2) 标准 MCP 调用(POST)
+curl -sS '${gatewayUrl}' \\
+  -H 'Content-Type: application/json' \\
+  -H 'Accept: application/json, text/event-stream' \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+
+# 查看网关/token 状态
+curl '${gatewayUrl}/health'
+# 强制重新登录
+curl -X POST '${gatewayUrl}/login'`;
+}
+
 export function workerDeploySnippet(workerName = "connection"): string {
   return `# 1) 在项目根目录确认这两个文件已存在(本项目已自带):
 #      worker/index.js   ← 带 /__proxy 代理路由的 Worker

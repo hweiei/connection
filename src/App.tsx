@@ -19,6 +19,7 @@ import {
   pythonCorsSnippet, nodeCorsSnippet, claudeCodeCmd, inspectorCmd,
   cursorConfig, claudeDesktopConfig, tokenConfig, curlSnippet,
   workerDeploySnippet, workerProxyTestSnippet,
+  gatewayConfigSnippet, gatewayCurlSnippet,
 } from "./lib/snippets";
 
 /* ============ 预填:用户提供的隧道信息 ============ */
@@ -178,6 +179,12 @@ export default function App() {
   const [proxyErr, setProxyErr] = useState("");
   const [proxyInfo, setProxyInfo] = useState<any>(null);
 
+  // 自动 OAuth 网关
+  const [gwState, setGwState] = useState<"unknown" | "checking" | "ready" | "loggingin" | "error">("unknown");
+  const [gwInfo, setGwInfo] = useState<any>(null);
+  const [gwErr, setGwErr] = useState("");
+  const gatewayUrl = useMemo(() => `${workerBase.replace(/\/$/, "")}/gateway`, [workerBase]);
+
   // 诊断
   const [diagSteps, setDiagSteps] = useState<DiagStep[]>([]);
   const [diag, setDiag] = useState<DiagResult | null>(null);
@@ -194,7 +201,7 @@ export default function App() {
   const [cb, setCb] = useState<{ phase: "exchanging" | "success" | "error"; msg: string; token?: string } | null>(null);
 
   // 修复指南
-  const [fixTab, setFixTab] = useState<"worker" | "py" | "node" | "claude" | "inspector" | "cursor" | "desktop" | "curl">("worker");
+  const [fixTab, setFixTab] = useState<"gateway" | "worker" | "py" | "node" | "claude" | "inspector" | "cursor" | "desktop" | "curl">("gateway");
   const fixRef = useRef<HTMLDivElement>(null);
 
   const clientRef = useRef<McpClient | null>(null);
@@ -241,6 +248,60 @@ export default function App() {
 
   const checkProxyRef = useRef(checkProxy);
   useEffect(() => { checkProxyRef.current = checkProxy; }, [checkProxy]);
+
+  /* 探测自动 OAuth 网关状态 */
+  const checkGateway = useCallback(async () => {
+    setGwState("checking");
+    setGwErr("");
+    try {
+      const r = await fetch(`${gatewayUrl}/health`, { cache: "no-store" });
+      const ct = r.headers.get("content-type") || "";
+      if (!r.ok || !ct.includes("json")) {
+        setGwState("error");
+        setGwErr(`Worker 上还没有 /gateway 路由(HTTP ${r.status})。请部署最新的 worker/index.js`);
+        addLog("warn", `网关不可用: HTTP ${r.status},需部署带 /gateway 的新版 Worker`);
+        return;
+      }
+      const info = await r.json();
+      setGwInfo(info);
+      setGwState("ready");
+      addLog("success", `✓ 自动 OAuth 网关就绪`, JSON.stringify(info, null, 2));
+    } catch (e: any) {
+      setGwState("error");
+      setGwErr(String(e?.message || e));
+      addLog("warn", `网关探测失败: ${e?.message}`);
+    }
+  }, [gatewayUrl, addLog]);
+
+  /* 触发网关登录 + 通过网关连接 */
+  const connectViaGateway = useCallback(async () => {
+    setGwState("loggingin");
+    addLog("info", "让 Worker 网关自动完成 OAuth 登录…");
+    try {
+      const r = await fetch(`${gatewayUrl}/login`, { method: "POST" });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        setGwState("error");
+        setGwErr(j.error || `HTTP ${r.status}`);
+        addLog("error", `网关自动登录失败: ${j.error || r.status}`, (j.debug || []).join("\n"));
+        return;
+      }
+      addLog("success", "网关自动登录成功!改用网关地址连接(无需 token)…", (j.debug || []).join("\n"));
+      setGwState("ready");
+      // 把 MCP 端点切成网关地址,关闭 __proxy(网关自带认证与转发),清空 token
+      setProxyOn(false);
+      setToken("");
+      setMcpUrl(gatewayUrl);
+      setTimeout(() => connectRef.current(null), 400);
+    } catch (e: any) {
+      setGwState("error");
+      setGwErr(String(e?.message || e));
+      addLog("error", `网关登录请求失败: ${e?.message}`);
+    }
+  }, [gatewayUrl, addLog]);
+
+  const checkGatewayRef = useRef(checkGateway);
+  useEffect(() => { checkGatewayRef.current = checkGateway; }, [checkGateway]);
 
   /* ---------- 连接 ---------- */
   const connect = useCallback(async (tokenOverride?: string | null) => {
@@ -495,6 +556,7 @@ export default function App() {
     addLog("info", "已知服务端信息:OAuth 端点 /oauth/authorize、/oauth/token、/oauth/register,仅支持 authorization_code");
     const t = setTimeout(async () => {
       await checkProxyRef.current(false);
+      checkGatewayRef.current();
       doDiagnose(true);
     }, 400);
 
@@ -832,6 +894,46 @@ export default function App() {
                 </div>
               )}
             </div>
+          </motion.section>
+
+          {/* 自动 OAuth 网关 */}
+          <motion.section initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} className={`glass rounded-2xl border p-4 ${gwState === "ready" ? "border-violet-400/40" : gwState === "error" ? "border-amber-400/30" : "border-white/10"}`}>
+            <div className="flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-bold text-white"><Sparkles size={15} className="text-violet-400" /> 自动 OAuth 网关 <span className="rounded-full bg-violet-400/15 px-2 py-0.5 text-[10px] font-medium text-violet-300">零配置</span></h2>
+              <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium ${gwState === "ready" ? "bg-violet-400/15 text-violet-300" : gwState === "checking" || gwState === "loggingin" ? "bg-amber-400/15 text-amber-300" : gwState === "error" ? "bg-amber-500/15 text-amber-300" : "bg-white/8 text-slate-400"}`}>
+                {gwState === "checking" || gwState === "loggingin" ? <Loader2 size={11} className="animate-spin" /> : gwState === "ready" ? <CircleCheck size={11} /> : gwState === "error" ? <TriangleAlert size={11} /> : <CircleDashed size={11} />}
+                {gwState === "ready" ? "就绪" : gwState === "checking" ? "探测中" : gwState === "loggingin" ? "登录中" : gwState === "error" ? "需部署" : "未知"}
+              </span>
+            </div>
+            <p className="mt-2 text-[12px] leading-relaxed text-slate-400">
+              AI / 客户端只需把下面这个地址当成<b className="text-slate-200">免认证的 MCP 端点</b>,Worker 内部会用内置 password <b className="text-slate-200">自动完成 OAuth 登录</b>并转发请求 —— GET 也会被自动转成 MCP initialize。
+            </p>
+            <div className="mt-2.5">
+              <label className="mb-1.5 flex items-center justify-between text-[11px] font-medium text-slate-400">网关端点(给 AI 用) <CopyBtn text={gatewayUrl} /></label>
+              <div className="code-font truncate rounded-xl border border-violet-400/20 bg-violet-400/5 px-3 py-2.5 text-[12px] text-violet-100">{gatewayUrl}</div>
+            </div>
+            <div className="mt-2.5 grid grid-cols-2 gap-2">
+              <button onClick={checkGateway} disabled={gwState === "checking"} className="flex items-center justify-center gap-1.5 rounded-xl border border-white/12 bg-white/5 px-3 py-2.5 text-[12.5px] font-medium text-slate-200 hover:border-white/25 disabled:opacity-60">
+                {gwState === "checking" ? <Loader2 size={14} className="animate-spin" /> : <Radio size={14} />} 探测网关
+              </button>
+              <button onClick={connectViaGateway} disabled={gwState === "loggingin"} className="flex items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-500 px-3 py-2.5 text-[12.5px] font-bold text-white shadow-lg shadow-violet-500/25 hover:shadow-violet-400/40 disabled:opacity-60">
+                {gwState === "loggingin" ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />} 经网关连接
+              </button>
+            </div>
+            {gwState === "ready" && gwInfo && (
+              <div className="mt-2.5 rounded-xl border border-violet-400/25 bg-violet-500/8 p-3 text-[11.5px] leading-relaxed text-violet-100">
+                ✅ 网关在线。目标: <span className="code-font">{gwInfo.mcpUrl?.replace(/^https?:\/\//, "")}</span>
+                {gwInfo.token?.present ? <span className="ml-1 text-emerald-300">· token 已缓存({gwInfo.token.expiresInSec}s)</span> : <span className="ml-1 text-slate-400">· 尚未登录(点「经网关连接」触发)</span>}
+                <button onClick={() => scrollToFix("gateway")} className="mt-2 flex items-center gap-1.5 text-[11.5px] font-semibold text-violet-200 hover:text-white"><Code2 size={12} /> 复制给 Claude/Cursor 的配置 →</button>
+              </div>
+            )}
+            {gwState === "error" && (
+              <div className="mt-2.5 rounded-xl border border-amber-400/25 bg-amber-500/8 p-3 text-[11.5px] leading-relaxed text-amber-100">
+                <p className="font-semibold">Worker 还没有 /gateway 路由</p>
+                <p className="mt-1 text-amber-200/80">{gwErr}</p>
+                <button onClick={() => scrollToFix("worker")} className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-400/20 px-3 py-1.5 text-[11.5px] font-semibold text-amber-100 hover:bg-amber-400/30"><Code2 size={12} /> 部署最新 Worker</button>
+              </div>
+            )}
           </motion.section>
 
           {/* 连接设置 */}
@@ -1252,7 +1354,8 @@ export default function App() {
           </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
             {([
-              { id: "worker", label: "⭐ 部署 Worker 代理", icon: Cloud },
+              { id: "gateway", label: "⭐ 自动 OAuth 网关(给 AI)", icon: Sparkles },
+              { id: "worker", label: "部署 Worker", icon: Cloud },
               { id: "py", label: "服务端加 CORS(Python)", icon: Code2 },
               { id: "node", label: "服务端加 CORS(Node)", icon: Code2 },
               { id: "claude", label: "Claude Code", icon: MonitorSmartphone },
@@ -1268,6 +1371,12 @@ export default function App() {
           </div>
           <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_320px]">
             <div>
+              {fixTab === "gateway" && (
+                <div className="space-y-2">
+                  <CodeBlock code={gatewayConfigSnippet(gatewayUrl)} maxHeight={180} />
+                  <CodeBlock code={gatewayCurlSnippet(gatewayUrl)} maxHeight={260} />
+                </div>
+              )}
               {fixTab === "worker" && (
                 <div className="space-y-2">
                   <CodeBlock code={workerDeploySnippet()} maxHeight={300} />
@@ -1283,9 +1392,25 @@ export default function App() {
               {fixTab === "curl" && <CodeBlock code={curlSnippet(mcpUrl, token || null)} maxHeight={200} />}
             </div>
             <div className="space-y-2 text-[12px] leading-relaxed text-slate-400">
+              {fixTab === "gateway" && (
+                <>
+                  <p className="font-semibold text-slate-200">让 AI 零配置接入 ⭐</p>
+                  <p>把 <span className="code-font text-slate-300">/gateway</span> 地址填给 Claude Code / Cursor 等客户端就行,<b>不用填任何 token</b>。Worker 内部会:</p>
+                  <ul className="list-disc space-y-1 pl-4">
+                    <li>首次请求时用内置 password 自动跑完 OAuth PKCE 登录</li>
+                    <li>缓存 access_token,给每个请求自动加 <span className="code-font">Authorization</span></li>
+                    <li>token 过期(401)时自动重新登录并重试</li>
+                    <li>AI 发的 GET 会被自动转成 MCP <span className="code-font">initialize</span></li>
+                  </ul>
+                  <div className="rounded-lg border border-violet-400/25 bg-violet-400/8 p-2.5 text-[11.5px] text-violet-100">
+                    <p className="font-semibold">安全建议</p>
+                    <p className="mt-1">password 通过环境变量注入,别写进代码。在 CF 控制台设为 Secret:<span className="code-font">wrangler secret put MCP_PASSWORD</span>。若自动登录因授权页需人工点按钮而失败,可改用 <span className="code-font">MCP_TOKEN</span> 手动注入一个有效 token。</p>
+                  </div>
+                </>
+              )}
               {fixTab === "worker" && (
                 <>
-                  <p className="font-semibold text-slate-200">这是最推荐的方案 ⭐</p>
+                  <p className="font-semibold text-slate-200">这是底层中继方案</p>
                   <p>你的 Worker <span className="code-font text-slate-300">{workerBase.replace(/^https?:\/\//, "")}</span> 已经在托管这个页面。只要再给它加一个 <span className="code-font text-slate-300">/__proxy</span> 路由,它就能<b>替浏览器去连你的 CF 隧道</b>。</p>
                   <div className="rounded-lg border border-emerald-400/25 bg-emerald-400/8 p-2.5 text-[11.5px] text-emerald-100">
                     <p className="font-semibold">为什么这样就不会被 CORS 拦?</p>
